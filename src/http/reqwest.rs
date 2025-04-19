@@ -52,7 +52,7 @@ impl HttpClient for reqwest::Client {
         let mut hashcash_challenge: Option<(String, u8)> = None;
 
         for attempt in 1..=state.max_retries {
-            if attempt > 1 {
+            if attempt > 1 && hashcash_challenge.is_none() {
                 tracing::debug!(?delay, "sleeping for exponential back‑off before retrying");
                 tokio::time::sleep(delay).await;
                 delay = std::cmp::min(delay * 2, state.max_retry_delay);
@@ -65,6 +65,8 @@ impl HttpClient for reqwest::Client {
                 let header_value = format!("1:{token}:{stamp}");
                 builder = builder.header("x-hashcash", header_value.clone());
                 tracing::trace!(header=%header_value, "attached solved X‑Hashcash header");
+
+                hashcash_challenge = None;
             }
 
             let request_fut = builder.json(requests).send();
