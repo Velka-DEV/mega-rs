@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures::io::AsyncRead;
 use futures::TryStreamExt;
 use json::Value;
-use reqwest::Body;
+use reqwest::{Body, StatusCode};
 use secrecy::ExposeSecret;
 use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -15,6 +15,7 @@ use url::Url;
 use crate::error::{Error, Result};
 use crate::http::HttpClient;
 use crate::protocol::commands::{Request, Response};
+use crate::utils::hashcash::{gencash, parse_hashcash_header};
 use crate::{ClientState, ErrorCode};
 
 #[async_trait]
@@ -48,85 +49,96 @@ impl HttpClient for reqwest::Client {
         };
 
         let mut delay = state.min_retry_delay;
+        let mut hashcash_challenge: Option<(String, u8)> = None;
+
         for attempt in 1..=state.max_retries {
             if attempt > 1 {
-                tracing::debug!(?delay, "sleeping for exponential backoff before retrying");
+                tracing::debug!(?delay, "sleeping for exponential back‑off before retrying");
                 tokio::time::sleep(delay).await;
-                delay *= 2;
-                // TODO: maybe add some small random jitter after the doubling.
-                if delay > state.max_retry_delay {
-                    delay = state.max_retry_delay;
-                }
+                delay = std::cmp::min(delay * 2, state.max_retry_delay);
             }
 
-            // dbg!(&requests);
-            tracing::debug!(?attempt, "starting MEGA request attempt");
+            let mut builder = self.post(url.clone());
 
-            let request = async {
-                self.post(url.clone())
-                    .json(requests)
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .bytes()
-                    .await
-            };
+            if let Some((ref token, easiness)) = hashcash_challenge {
+                let stamp = gencash(token, easiness);
+                let header_value = format!("1:{token}:{stamp}");
+                builder = builder.header("x-hashcash", header_value.clone());
+                tracing::trace!(header=%header_value, "attached solved X‑Hashcash header");
+            }
 
-            let maybe_response = if let Some(timeout) = state.timeout {
-                tracing::debug!(?timeout, "attempting MEGA request with timeout");
-                let Ok(maybe_response) = tokio::time::timeout(timeout, request).await else {
-                    // the timeout has been reached, let's retry.
-                    tracing::debug!("MEGA request has timed out");
-                    continue;
-                };
-                maybe_response
+            let request_fut = builder.json(requests).send();
+
+            let response = match if let Some(timeout) = state.timeout {
+                tokio::time::timeout(timeout, request_fut).await
             } else {
-                request.await
-            };
-
-            let response = match maybe_response {
-                Ok(response) => response,
-                Err(error) => {
-                    // this could be a network issue, let's retry.
-                    tracing::error!(?error, "`reqwest` error when making MEGA request");
+                Ok(request_fut.await)
+            } {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::error!(?e, "network error while making MEGA request");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(?e, "timeout while making MEGA request");
                     continue;
                 }
             };
 
-            // try to parse a request-level error first.
-            if let Ok(code) = json::from_slice::<ErrorCode>(&response) {
+            // ─────────────────────────────────────────────────────────────────────
+            // 409 = Payment‑Required → the server is challenging us with Hashcash
+            // ─────────────────────────────────────────────────────────────────────
+            if response.status() == StatusCode::PAYMENT_REQUIRED {
+                tracing::debug!("received 409 – server requests Hashcash proof‑of‑work");
+
+                if let Some((token, easiness)) = response
+                    .headers()
+                    .get("x-hashcash")
+                    .and_then(parse_hashcash_header)
+                {
+                    hashcash_challenge = Some((token.clone(), easiness));
+                    tracing::trace!(token = %token, easiness, "parsed Hashcash challenge");
+                    continue;
+                }
+
+                tracing::error!("409 received but no valid Hashcash challenge found — aborting");
+                return Err(Error::MaxRetriesReached);
+            }
+
+            // ─────────────────────────────────────────────────────────────────────
+            // The response did not ask for Hashcash – handle as usual
+            // ─────────────────────────────────────────────────────────────────────
+            let response_bytes = match response.error_for_status() {
+                Ok(ok) => ok.bytes().await?,
+                Err(err) => {
+                    tracing::error!(%err, "HTTP error status, will retry");
+                    continue;
+                }
+            };
+
+            if let Ok(code) = json::from_slice::<ErrorCode>(&response_bytes) {
                 if code == ErrorCode::EAGAIN {
-                    // this error code suggests we might succeed if retried, let's retry.
-                    tracing::debug!("received `EAGAIN` error code from MEGA");
                     continue;
                 }
                 if code != ErrorCode::OK {
-                    tracing::error!(?code, "received error code from MEGA");
+                    tracing::error!(?code, "MEGA error code");
                 }
                 return Err(Error::from(code));
             }
 
-            // dbg!(&responses);
-            let responses: Vec<Value> = match json::from_slice(&response) {
-                Ok(responses) => responses,
-                Err(error) => {
-                    tracing::error!(
-                        ?error,
-                        "could not deserialize MEGA response as a JSON array",
-                    );
-                    return Err(error.into());
-                }
-            };
+            let responses: Vec<Value> = json::from_slice(&response_bytes).map_err(|e| {
+                tracing::error!(?e, "could not deserialize MEGA response array");
+                e
+            })?;
 
             return requests
                 .iter()
                 .zip(responses)
-                .map(|(request, response)| request.parse_response_data(response))
+                .map(|(req, resp)| req.parse_response_data(resp))
                 .collect();
         }
 
-        tracing::error!("maximum amount of retries reached, cancelling MEGA request");
-
+        tracing::error!("maximum retries reached, cancelling MEGA request");
         Err(Error::MaxRetriesReached)
     }
 

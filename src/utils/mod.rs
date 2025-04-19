@@ -12,6 +12,7 @@ use rand::distributions::{Alphanumeric, DistString};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Sha512};
 
+pub mod hashcash;
 pub mod rsa;
 
 use crate::http::UserSession;
