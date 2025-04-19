@@ -61,7 +61,14 @@ impl HttpClient for reqwest::Client {
             let mut builder = self.post(url.clone());
 
             if let Some((ref token, easiness)) = hashcash_challenge {
-                let stamp = gencash(token, easiness);
+                // Use a blocking worker to generate the hashcash stamp. This allows the CPU to
+                // be used more efficiently, instead of blocking the tokio runtime.
+                let stamp = tokio::task::spawn_blocking({
+                    let token = token.clone();
+                    move || gencash(&token, easiness)
+                })
+                .await
+                .expect("hashcash worker panicked");
                 let header_value = format!("1:{token}:{stamp}");
                 builder = builder.header("x-hashcash", header_value.clone());
                 tracing::trace!(header=%header_value, "attached solved X‑Hashcash header");
